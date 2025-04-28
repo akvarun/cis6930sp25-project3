@@ -1,70 +1,86 @@
 import pika
-import json
+import socket
 from loguru import logger
+import concurrent.futures
+import time
 
 # Configure logging
-logger.add("rabbitmq_check.log", rotation="1 MB", retention="3 days", 
+logger.add("rabbitmq_scan.log", rotation="1 MB", retention="1 day",
            format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
 
-def check_rabbitmq(host: str, exchange: str = 'ufo'):
-    """
-    Basic script to check RabbitMQ connection and log incoming messages
-    """
+def test_rabbitmq_connection(host):
+    """Test connection to a specific RabbitMQ host"""
+    hostname = f"{host}.cm.cluster"
+    result = {"host": hostname, "success": False, "error": None}
+    
     try:
-        # Establish connection
-        connection = pika.BlockingConnection(
-            pika.ConnectionParameters(
-                host=host,
-                credentials=pika.PlainCredentials('guest', 'guest')
-            )
+        # First check basic connectivity
+        socket.create_connection((hostname, 5672), timeout=5)
+        
+        # Then test RabbitMQ connection
+        credentials = pika.PlainCredentials('guest', 'guest')
+        parameters = pika.ConnectionParameters(
+            host=hostname,
+            port=5672,
+            credentials=credentials,
+            connection_attempts=2,
+            retry_delay=1,
+            socket_timeout=3
         )
-        channel = connection.channel()
         
-        # Declare exchange (same as publisher)
-        channel.exchange_declare(exchange=exchange, exchange_type='fanout')
-        
-        # Create temporary queue
-        result = channel.queue_declare(queue='', exclusive=True)
-        queue_name = result.method.queue
-        
-        # Bind to exchange
-        channel.queue_bind(exchange=exchange, queue=queue_name)
-        
-        logger.info(f"Successfully connected to RabbitMQ server at {host}")
-        logger.info(f"Listening on exchange '{exchange}' (fanout)")
-        logger.info("Waiting for messages. Press Ctrl+C to exit...")
-
-        def callback(ch, method, properties, body):
-            try:
-                message = json.loads(body.decode())
-                logger.info(f"Received message: {message}")
-            except json.JSONDecodeError:
-                logger.warning(f"Received non-JSON message: {body.decode()}")
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
-
-        # Start consuming
-        channel.basic_consume(
-            queue=queue_name,
-            on_message_callback=callback,
-            auto_ack=True
-        )
-
-        channel.start_consuming()
-
-    except pika.exceptions.AMQPConnectionError:
-        logger.error(f"Failed to connect to RabbitMQ server at {host}")
-    except KeyboardInterrupt:
-        logger.info("Gracefully shutting down...")
+        connection = pika.BlockingConnection(parameters)
         connection.close()
+        result["success"] = True
+        logger.success(f"✅ Successfully connected to {hostname}")
+        
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        if 'connection' in locals() and connection.is_open:
-            connection.close()
+        result["error"] = str(e)
+        logger.warning(f"❌ Failed to connect to {hostname}: {str(e)}")
+    
+    return result
+
+def scan_all_servers():
+    """Scan all possible servers in parallel"""
+    hosts_to_scan = []
+    
+    # Generate all possible hostnames
+    hosts_to_scan.extend([f"cpu{num:03d}" for num in range(1, 3)])  # cpu001-cpu002
+    hosts_to_scan.extend([f"gpu{num:03d}" for num in range(1, 23)])  # gpu001-gpu022
+    
+    logger.info(f"Starting scan of {len(hosts_to_scan)} RabbitMQ servers...")
+    
+    successful_connections = []
+    
+    # Use ThreadPoolExecutor to scan in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_host = {
+            executor.submit(test_rabbitmq_connection, host): host 
+            for host in hosts_to_scan
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_host):
+            result = future.result()
+            if result["success"]:
+                successful_connections.append(result["host"])
+    
+    # Print summary
+    logger.info("\n=== Scan Results ===")
+    if successful_connections:
+        logger.success("Found working RabbitMQ servers:")
+        for host in successful_connections:
+            logger.success(f"  - {host}")
+    else:
+        logger.error("No working RabbitMQ servers found")
+    
+    return successful_connections
 
 if __name__ == "__main__":
-    # Replace with your actual RabbitMQ host
-    RABBITMQ_HOST = "cpu001.cm.cluster"  
+    start_time = time.time()
+    working_servers = scan_all_servers()
+    duration = time.time() - start_time
     
-    logger.info("Starting RabbitMQ connection check...")
-    check_rabbitmq(RABBITMQ_HOST)
+    logger.info(f"\nScan completed in {duration:.2f} seconds")
+    
+    if working_servers:
+        logger.info("\nTo use a working server, update your code with:")
+        logger.info(f"host = '{working_servers[0]}'")
